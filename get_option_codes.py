@@ -25,7 +25,7 @@ def get_filtered_options(product_id, underlying_price, db_config, otm_range_pct=
         cursor = conn.cursor(dictionary=True)
 
         query = (
-            "SELECT InstrumentID, StrikePrice, OptionsType, ExpireDate "
+            "SELECT InstrumentID, StrikePrice, OptionsType, ExpireDate, VolumeMultiple "
             "FROM contract_specs WHERE UPPER(UnderlyingInstrID) = UPPER(%s)"
         )
         cursor.execute(query, (product_id.strip(),))

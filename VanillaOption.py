@@ -57,3 +57,36 @@ class VanillaOption:
         except Exception:
             # Suppress error printing for cleaner output in a loop
             return None
+
+    def calculate_greeks(self, underlying_price, r, q, vol):
+        """
+        Calculates option greeks using the supplied implied volatility.
+        :return: Dict with delta/gamma/theta/vega, or None values if calculation fails.
+        """
+        if vol is None or vol <= 0:
+            return {
+                "delta": None,
+                "gamma": None,
+                "theta": None,
+                "vega": None,
+            }
+
+        try:
+            proc = xh.FastGeneralizedBlackScholesProcessMaker(
+                underlying_price, q, r, vol, xh.Business244
+            )
+            eng = xh.AnalyticEuropeanEngineMaker()
+            rst = xh.OneAssetOptionCalculator(self.xh_option, eng, proc)
+            return {
+                "delta": rst.delta(),
+                "gamma": rst.gamma(),
+                "theta": rst.theta(),
+                "vega": rst.vega(),
+            }
+        except Exception:
+            return {
+                "delta": None,
+                "gamma": None,
+                "theta": None,
+                "vega": None,
+            }

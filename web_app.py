@@ -7,22 +7,25 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-# --- Check Dependencies ---
 try:
     import XHPricingPy as xh
 except ImportError:
     st.error("Missing dependencies. Please run: pip install XHPricingPy mysql-connector-python streamlit pandas altair")
     st.stop()
 
-# --- Local Imports ---
 from VanillaOption import VanillaOption
 from get_option_codes import get_available_underlyings, get_filtered_options
 from iv_curve_storage import ensure_tables, load_recent_curve_points, save_curve_snapshot
 from quote_engine import CTPMarketEngine
 
+DEFAULT_BATCH_SAVE_UNDERLYINGS = [
+    "cu2604",
+    "cu2605",
+    "cu2606",
+]
+
 
 def load_config_from_xml(file_path="config.xml"):
-    """Loads CTP and DB configuration from an XML file."""
     if not os.path.isabs(file_path):
         file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
 
@@ -47,22 +50,18 @@ def load_config_from_xml(file_path="config.xml"):
 
 @st.cache_resource
 def get_market_engine(md_front, broker_id, user_id, password):
-    """Initializes and caches the CTP Market Engine."""
-    print("Initializing CTP Market Engine...")
     engine = CTPMarketEngine(md_front, broker_id, user_id, password)
     engine.start()
     return engine
 
 
-def create_bs_process(underlying_price, r, q):
-    """Creates the Black-Scholes process for pricing."""
+def create_bs_process(underlying_price, r, q, vol=0.20):
     return xh.FastGeneralizedBlackScholesProcessMaker(
-        underlying_price, q, r, 0.20, xh.Business244
+        underlying_price, q, r, vol, xh.Business244
     )
 
 
 def update_eval_date(selected_date):
-    """Updates the global XHPricingPy evaluation date."""
     month_map = {
         1: xh.Jan,
         2: xh.Feb,
@@ -110,6 +109,120 @@ def build_snapshot_payload(product_id, underlying_price, r, q, eval_date, otm_ra
     return {"snapshot": snapshot, "curve_points": curve_points}
 
 
+def parse_underlying_list(raw_text):
+    return [item.strip() for item in raw_text.split(",") if item.strip()]
+
+
+def format_greek(value):
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
+
+def calculate_curve_data(engine, product_id, r, q, db_config, otm_range_pct, curve_mode):
+    engine.subscribe([product_id.encode("utf-8")])
+
+    underlying_price = 0.0
+    for _ in range(30):
+        quote = engine.get_quote(product_id)
+        if quote and quote.get("last", 0) > 0:
+            underlying_price = quote["last"]
+            break
+        time.sleep(0.1)
+
+    if underlying_price <= 0:
+        return None, None, f"Could not fetch price for {product_id}. Market may be closed."
+
+    specs = get_filtered_options(
+        product_id,
+        underlying_price,
+        db_config,
+        otm_range_pct=otm_range_pct,
+    )
+    if not specs:
+        return None, None, f"No matching OTM options found for {product_id}."
+
+    inst_ids = [spec["InstrumentID"].encode("utf-8") for spec in specs]
+    engine.subscribe(inst_ids)
+    time.sleep(1.5)
+
+    bs_process = create_bs_process(underlying_price, r, q)
+    data = []
+
+    for spec in specs:
+        inst = spec["InstrumentID"]
+        quote = engine.get_quote(inst)
+        if not quote:
+            continue
+
+        opt = VanillaOption(inst, spec["StrikePrice"], spec["ExpireDate"], spec["OptionsType"])
+        bid_iv = opt.calculate_implied_vol(quote["bid"], bs_process)
+        ask_iv = opt.calculate_implied_vol(quote["ask"], bs_process)
+        expire_date = datetime.strptime(spec["ExpireDate"], "%Y%m%d").date()
+
+        if curve_mode == "Bid/Ask":
+            if bid_iv is not None:
+                bid_greeks = opt.calculate_greeks(underlying_price, r, q, bid_iv)
+                data.append(
+                    {
+                        "InstrumentID": inst,
+                        "Strike": spec["StrikePrice"],
+                        "Type": spec["OptionsType"],
+                        "ExpireDate": expire_date,
+                        "IV": bid_iv,
+                        "Side": "Bid",
+                        "Price": quote["bid"],
+                        "VolumeMultiple": spec.get("VolumeMultiple", 1),
+                        "Delta": format_greek(bid_greeks["delta"]),
+                        "Gamma": format_greek(bid_greeks["gamma"]),
+                        "Theta": format_greek(bid_greeks["theta"]),
+                        "Vega": format_greek(bid_greeks["vega"]),
+                    }
+                )
+            if ask_iv is not None:
+                ask_greeks = opt.calculate_greeks(underlying_price, r, q, ask_iv)
+                data.append(
+                    {
+                        "InstrumentID": inst,
+                        "Strike": spec["StrikePrice"],
+                        "Type": spec["OptionsType"],
+                        "ExpireDate": expire_date,
+                        "IV": ask_iv,
+                        "Side": "Ask",
+                        "Price": quote["ask"],
+                        "VolumeMultiple": spec.get("VolumeMultiple", 1),
+                        "Delta": format_greek(ask_greeks["delta"]),
+                        "Gamma": format_greek(ask_greeks["gamma"]),
+                        "Theta": format_greek(ask_greeks["theta"]),
+                        "Vega": format_greek(ask_greeks["vega"]),
+                    }
+                )
+        elif bid_iv is not None and ask_iv is not None:
+            mid_iv = (bid_iv + ask_iv) / 2
+            mid_greeks = opt.calculate_greeks(underlying_price, r, q, mid_iv)
+            data.append(
+                {
+                    "InstrumentID": inst,
+                    "Strike": spec["StrikePrice"],
+                    "Type": spec["OptionsType"],
+                    "ExpireDate": expire_date,
+                    "IV": mid_iv,
+                    "Side": "Mid",
+                    "Price": (quote["bid"] + quote["ask"]) / 2,
+                    "VolumeMultiple": spec.get("VolumeMultiple", 1),
+                    "Delta": format_greek(mid_greeks["delta"]),
+                    "Gamma": format_greek(mid_greeks["gamma"]),
+                    "Theta": format_greek(mid_greeks["theta"]),
+                    "Vega": format_greek(mid_greeks["vega"]),
+                }
+            )
+
+    if not data:
+        return underlying_price, None, f"No volatility data calculated for {product_id}."
+
+    return underlying_price, data, None
+
+
 def build_chart_dataframe(current_df, current_label, history_df):
     current_chart_df = current_df.copy()
     current_chart_df["CurveLabel"] = current_label
@@ -128,6 +241,53 @@ def build_chart_dataframe(current_df, current_label, history_df):
         }
     )
     return pd.concat([history_chart_df, current_chart_df], ignore_index=True, sort=False)
+
+
+def build_position_exposure_dataframe(df, underlying_price):
+    exposure_df = df.copy()
+    if "OrderLots" not in exposure_df.columns:
+        exposure_df["OrderLots"] = 0
+
+    exposure_df["OrderLots"] = pd.to_numeric(exposure_df["OrderLots"], errors="coerce").fillna(0).astype(int)
+    exposure_df["DailyMove"] = underlying_price * exposure_df["IV"] / 15.56
+    exposure_df["TotalDeltaLots"] = exposure_df["Delta"] * exposure_df["OrderLots"]
+    exposure_df["TotalGammaPnl"] = (
+        0.5
+        * exposure_df["Gamma"]
+        * exposure_df["DailyMove"]
+        * exposure_df["DailyMove"]
+        * exposure_df["OrderLots"]
+        * exposure_df["VolumeMultiple"].fillna(1)
+    )
+    exposure_df["TotalThetaDaily"] = (
+        exposure_df["Theta"] * exposure_df["OrderLots"] * exposure_df["VolumeMultiple"].fillna(1) / 244
+    )
+    exposure_df["TotalVega1Pct"] = (
+        exposure_df["Vega"] * 0.01 * exposure_df["OrderLots"] * exposure_df["VolumeMultiple"].fillna(1)
+    )
+    return exposure_df
+
+
+def highlight_derived_columns(styler, derived_columns):
+    def apply_style(series):
+        if series.name in derived_columns:
+            return ["background-color: #fff3cd; color: #5c4400"] * len(series)
+        return [""] * len(series)
+
+    return styler.apply(apply_style, axis=0)
+
+
+def filter_visible_curves(chart_df, history_df, selected_history_labels):
+    if not selected_history_labels:
+        visible_chart_df = chart_df[chart_df["CurveSource"] == "Current"].copy()
+        visible_history_df = history_df.iloc[0:0].copy()
+        return visible_chart_df, visible_history_df
+
+    visible_chart_df = chart_df[
+        (chart_df["CurveSource"] == "Current") | (chart_df["CurveLabel"].isin(selected_history_labels))
+    ].copy()
+    visible_history_df = history_df[history_df["CurveLabel"].isin(selected_history_labels)].copy()
+    return visible_chart_df, visible_history_df
 
 
 def render_curve_section(display_payload):
@@ -152,8 +312,24 @@ def render_curve_section(display_payload):
         caption_parts.append(f"History window: {history_days} day(s)")
     st.caption(" | ".join(caption_parts))
 
+    visible_chart_df = chart_df
+    visible_history_df = history_df
+    if show_history and not history_df.empty:
+        history_labels = history_df["CurveLabel"].drop_duplicates().tolist()
+        selected_history_labels = st.multiselect(
+            "Visible history timestamps",
+            options=history_labels,
+            default=history_labels,
+            help="Uncheck timestamps to hide selected historical curves.",
+        )
+        visible_chart_df, visible_history_df = filter_visible_curves(
+            chart_df,
+            history_df,
+            selected_history_labels,
+        )
+
     chart_width = 780
-    base = alt.Chart(chart_df).encode(
+    base = alt.Chart(visible_chart_df).encode(
         x=alt.X("Strike:Q", scale=alt.Scale(zero=False), title="Strike Price"),
         y=alt.Y(
             "IV:Q",
@@ -169,12 +345,16 @@ def render_curve_section(display_payload):
             "Side",
             "CurveLabel",
             "Price",
+            alt.Tooltip("Delta", format=".4f"),
+            alt.Tooltip("Gamma", format=".6f"),
+            alt.Tooltip("Theta", format=".4f"),
+            alt.Tooltip("Vega", format=".4f"),
             alt.Tooltip("IV", format=".2%"),
         ],
     ).properties(width=chart_width, height=450)
 
     line = base.mark_line(interpolate="cardinal", tension=0.8)
-    current_points = alt.Chart(chart_df[chart_df["CurveSource"] == "Current"]).mark_point(
+    current_points = alt.Chart(visible_chart_df[visible_chart_df["CurveSource"] == "Current"]).mark_point(
         filled=True,
         size=60,
     ).encode(
@@ -193,6 +373,10 @@ def render_curve_section(display_payload):
             "Side",
             "CurveLabel",
             "Price",
+            alt.Tooltip("Delta", format=".4f"),
+            alt.Tooltip("Gamma", format=".6f"),
+            alt.Tooltip("Theta", format=".4f"),
+            alt.Tooltip("Vega", format=".4f"),
             alt.Tooltip("IV", format=".2%"),
         ],
     )
@@ -203,10 +387,86 @@ def render_curve_section(display_payload):
         st.altair_chart(chart, use_container_width=False)
 
     with st.expander("Raw Data"):
-        st.dataframe(df, use_container_width=True)
-        if show_history and not history_df.empty:
+        editable_df = df.copy()
+        if "OrderLots" not in editable_df.columns:
+            editable_df["OrderLots"] = 0
+
+        edited_df = st.data_editor(
+            editable_df,
+            hide_index=True,
+            use_container_width=True,
+            key=f"order_lots_editor_{product_id}_{curve_mode}",
+            column_config={
+                "OrderLots": st.column_config.NumberColumn(
+                    "OrderLots (hands)",
+                    min_value=0,
+                    step=1,
+                    format="%d",
+                ),
+            },
+        )
+
+        exposure_df = build_position_exposure_dataframe(edited_df, underlying_price)
+        display_df = exposure_df.rename(
+            columns={
+                "DailyMove": "dS",
+                "TotalDeltaLots": "TotalDelta (hands)",
+                "TotalGammaPnl": "TotalGamma (CNY)",
+                "TotalThetaDaily": "TotalTheta (CNY/day)",
+                "TotalVega1Pct": "TotalVega (CNY/1%)",
+            }
+        )
+        display_columns = [
+            "InstrumentID",
+            "Strike",
+            "Type",
+            "Side",
+            "Price",
+            "IV",
+            "Delta",
+            "Gamma",
+            "Theta",
+            "Vega",
+            "OrderLots",
+            "dS",
+            "TotalDelta (hands)",
+            "TotalGamma (CNY)",
+            "TotalTheta (CNY/day)",
+            "TotalVega (CNY/1%)",
+        ]
+        display_df = display_df[display_columns]
+        derived_columns = [
+            "OrderLots",
+            "dS",
+            "TotalDelta (hands)",
+            "TotalGamma (CNY)",
+            "TotalTheta (CNY/day)",
+            "TotalVega (CNY/1%)",
+        ]
+        styled_display_df = highlight_derived_columns(display_df.style, derived_columns)
+        st.dataframe(styled_display_df, use_container_width=True)
+
+        greek_totals = exposure_df[
+            ["TotalDeltaLots", "TotalGammaPnl", "TotalThetaDaily", "TotalVega1Pct"]
+        ].sum(numeric_only=True)
+        st.caption(
+            "Portfolio Greek totals"
+            f" | Delta: {greek_totals.get('TotalDeltaLots', 0.0):.4f} hands"
+            f" | Gamma: {greek_totals.get('TotalGammaPnl', 0.0):.4f} CNY"
+            f" | Theta: {greek_totals.get('TotalThetaDaily', 0.0):.4f} CNY/day"
+            f" | Vega: {greek_totals.get('TotalVega1Pct', 0.0):.4f} CNY/1%"
+        )
+        st.caption(
+            "Definition"
+            " | TotalDelta: Delta × OrderLots, unit = hands"
+            " | TotalGamma: 0.5 × Gamma × dS^2 × OrderLots × VolumeMultiple, unit = CNY"
+            " | TotalTheta: Theta × OrderLots × VolumeMultiple / 244, unit = CNY/day"
+            " | TotalVega: Vega × 1% × OrderLots × VolumeMultiple, unit = CNY/1%"
+        )
+
+        if show_history and not visible_history_df.empty:
             st.markdown("Historical Curves")
-            history_raw_df = history_df.rename(
+            history_raw_df = visible_history_df.rename(
                 columns={
                     "option_type": "Type",
                     "strike_price": "Strike",
@@ -251,6 +511,12 @@ def main():
         index=0,
         format_func=lambda days: f"{days} day(s)",
     )
+    batch_save_raw = st.sidebar.text_input(
+        "Batch Save Underlyings",
+        value=",".join(DEFAULT_BATCH_SAVE_UNDERLYINGS),
+        help="Comma-separated underlyings to recalculate and save when clicking Save Curve Data.",
+    )
+    batch_save_underlyings = parse_underlying_list(batch_save_raw)
 
     st.sidebar.markdown("---")
     auto_refresh = st.sidebar.checkbox("Enable Auto-Refresh (1 min)", value=False)
@@ -269,24 +535,63 @@ def main():
     manual_trigger = st.button("Fetch & Plot Volatility", type="primary", use_container_width=True)
 
     if "last_update_time" in st.session_state:
-        st.caption(f"最近一次更新: {st.session_state['last_update_time']}")
+        st.caption(f"Last update: {st.session_state['last_update_time']}")
 
     if st.session_state.get("save_feedback"):
         st.info(st.session_state["save_feedback"])
 
-    save_trigger = st.button("保存当前曲线", use_container_width=True)
+    save_trigger = st.button("Save Curve Data", use_container_width=True)
 
     if save_trigger:
-        pending_snapshot = st.session_state.get("pending_snapshot")
-        if pending_snapshot is None:
-            st.warning("当前没有可保存的曲线，请先刷新并绘制曲线。")
+        if not batch_save_underlyings:
+            st.warning("Batch save list is empty. Please provide at least one underlying.")
         else:
-            snapshot_id = save_curve_snapshot(
-                db_config,
-                pending_snapshot["snapshot"],
-                pending_snapshot["curve_points"],
-            )
-            st.session_state["save_feedback"] = f"已保存曲线快照 #{snapshot_id}"
+            saved_results = []
+            failed_results = []
+            with st.status("Saving curve snapshots...", expanded=True) as status:
+                for target_product_id in batch_save_underlyings:
+                    status.write(f"Recalculating {target_product_id}...")
+                    underlying_price, data, error_message = calculate_curve_data(
+                        engine,
+                        target_product_id,
+                        risk_free,
+                        dividend,
+                        db_config,
+                        otm_range_pct,
+                        curve_mode,
+                    )
+                    if error_message:
+                        failed_results.append(f"{target_product_id}: {error_message}")
+                        continue
+
+                    payload = build_snapshot_payload(
+                        target_product_id,
+                        underlying_price,
+                        risk_free,
+                        dividend,
+                        eval_date,
+                        otm_range_pct,
+                        curve_mode,
+                        data,
+                    )
+                    snapshot_id = save_curve_snapshot(
+                        db_config,
+                        payload["snapshot"],
+                        payload["curve_points"],
+                    )
+                    saved_results.append(f"{target_product_id}#{snapshot_id}")
+
+                if failed_results:
+                    status.update(label="Batch save completed with warnings", state="error")
+                else:
+                    status.update(label="Batch save completed", state="complete")
+
+            feedback_parts = []
+            if saved_results:
+                feedback_parts.append(f"Saved {len(saved_results)} snapshot(s): {', '.join(saved_results)}")
+            if failed_results:
+                feedback_parts.append(f"Failed {len(failed_results)}: {'; '.join(failed_results)}")
+            st.session_state["save_feedback"] = " | ".join(feedback_parts)
             st.rerun()
 
     if manual_trigger or auto_refresh:
@@ -312,102 +617,25 @@ def main():
 
 
 def run_process(engine, product_id, r, q, db_config, otm_range_pct, curve_mode, eval_date, show_history, history_days):
-    """Executes the data fetching and calculation pipeline."""
     with st.status("Processing Market Data...", expanded=True) as status:
-        status.write(f"Fetching spot price for {product_id}...")
-        engine.subscribe([product_id.encode("utf-8")])
-
-        underlying_price = 0.0
-        for _ in range(30):
-            quote = engine.get_quote(product_id)
-            if quote and quote.get("last", 0) > 0:
-                underlying_price = quote["last"]
-                break
-            time.sleep(0.1)
-
-        if underlying_price <= 0:
-            status.update(label="Error: No underlying price", state="error")
-            st.error(f"Could not fetch price for {product_id}. Market may be closed.")
-            return
-
-        status.write(f"Underlying Price: {underlying_price}")
-
-        specs = get_filtered_options(
+        status.write(f"Fetching and calculating curve for {product_id}...")
+        underlying_price, data, error_message = calculate_curve_data(
+            engine,
             product_id,
-            underlying_price,
+            r,
+            q,
             db_config,
-            otm_range_pct=otm_range_pct,
+            otm_range_pct,
+            curve_mode,
         )
-        if not specs:
-            status.update(label="Error: No options found", state="error")
-            st.error("No matching OTM options found in database.")
+        if error_message:
+            status.update(label="Error", state="error")
+            st.error(error_message)
             return
-
-        status.write(f"Found {len(specs)} OTM options within {otm_range_pct:.0%}. Subscribing...")
-
-        inst_ids = [spec["InstrumentID"].encode("utf-8") for spec in specs]
-        engine.subscribe(inst_ids)
-        time.sleep(1.5)
-
-        bs_process = create_bs_process(underlying_price, r, q)
-        data = []
-
-        for spec in specs:
-            inst = spec["InstrumentID"]
-            quote = engine.get_quote(inst)
-            if not quote:
-                continue
-
-            opt = VanillaOption(inst, spec["StrikePrice"], spec["ExpireDate"], spec["OptionsType"])
-            bid_iv = opt.calculate_implied_vol(quote["bid"], bs_process)
-            ask_iv = opt.calculate_implied_vol(quote["ask"], bs_process)
-            expire_date = datetime.strptime(spec["ExpireDate"], "%Y%m%d").date()
-
-            if curve_mode == "Bid/Ask":
-                if bid_iv is not None:
-                    data.append(
-                        {
-                            "InstrumentID": inst,
-                            "Strike": spec["StrikePrice"],
-                            "Type": spec["OptionsType"],
-                            "ExpireDate": expire_date,
-                            "IV": bid_iv,
-                            "Side": "Bid",
-                            "Price": quote["bid"],
-                        }
-                    )
-                if ask_iv is not None:
-                    data.append(
-                        {
-                            "InstrumentID": inst,
-                            "Strike": spec["StrikePrice"],
-                            "Type": spec["OptionsType"],
-                            "ExpireDate": expire_date,
-                            "IV": ask_iv,
-                            "Side": "Ask",
-                            "Price": quote["ask"],
-                        }
-                    )
-            elif bid_iv is not None and ask_iv is not None:
-                data.append(
-                    {
-                        "InstrumentID": inst,
-                        "Strike": spec["StrikePrice"],
-                        "Type": spec["OptionsType"],
-                        "ExpireDate": expire_date,
-                        "IV": (bid_iv + ask_iv) / 2,
-                        "Side": "Mid",
-                        "Price": (quote["bid"] + quote["ask"]) / 2,
-                    }
-                )
 
         status.update(label="Complete", state="complete")
 
     st.session_state["last_update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    if not data:
-        st.warning("No volatility data calculated. Check if market data is active.")
-        return
 
     df = pd.DataFrame(data)
     current_label = f"Current {st.session_state['last_update_time']}"
