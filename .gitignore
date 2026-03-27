@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+*.con
+DialogRsp.con
+QueryRsp.con
+TradingDay.con
+
+config.xml
