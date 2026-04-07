@@ -9,7 +9,7 @@ import streamlit as st
 
 try:
     import XHPricingPy as xh
-except ImportError:
+except (ImportError, RuntimeError):
     st.error("Missing dependencies. Please run: pip install XHPricingPy mysql-connector-python streamlit pandas altair")
     st.stop()
 
@@ -17,12 +17,6 @@ from VanillaOption import VanillaOption
 from get_option_codes import get_available_underlyings, get_filtered_options
 from iv_curve_storage import ensure_tables, load_recent_curve_points, save_curve_snapshot
 from quote_engine import CTPMarketEngine
-
-DEFAULT_BATCH_SAVE_UNDERLYINGS = [
-    "cu2604",
-    "cu2605",
-    "cu2606",
-]
 
 
 def load_config_from_xml(file_path="config.xml"):
@@ -107,10 +101,6 @@ def build_snapshot_payload(product_id, underlying_price, r, q, eval_date, otm_ra
         "notes": None,
     }
     return {"snapshot": snapshot, "curve_points": curve_points}
-
-
-def parse_underlying_list(raw_text):
-    return [item.strip() for item in raw_text.split(",") if item.strip()]
 
 
 def format_greek(value):
@@ -511,12 +501,6 @@ def main():
         index=0,
         format_func=lambda days: f"{days} day(s)",
     )
-    batch_save_raw = st.sidebar.text_input(
-        "Batch Save Underlyings",
-        value=",".join(DEFAULT_BATCH_SAVE_UNDERLYINGS),
-        help="Comma-separated underlyings to recalculate and save when clicking Save Curve Data.",
-    )
-    batch_save_underlyings = parse_underlying_list(batch_save_raw)
 
     st.sidebar.markdown("---")
     auto_refresh = st.sidebar.checkbox("Enable Auto-Refresh (1 min)", value=False)
@@ -540,58 +524,19 @@ def main():
     if st.session_state.get("save_feedback"):
         st.info(st.session_state["save_feedback"])
 
-    save_trigger = st.button("Save Curve Data", use_container_width=True)
+    save_trigger = st.button("Save Current Curve", use_container_width=True)
 
     if save_trigger:
-        if not batch_save_underlyings:
-            st.warning("Batch save list is empty. Please provide at least one underlying.")
+        pending_snapshot = st.session_state.get("pending_snapshot")
+        if pending_snapshot is None:
+            st.warning("There is no curve to save. Please fetch and plot a curve first.")
         else:
-            saved_results = []
-            failed_results = []
-            with st.status("Saving curve snapshots...", expanded=True) as status:
-                for target_product_id in batch_save_underlyings:
-                    status.write(f"Recalculating {target_product_id}...")
-                    underlying_price, data, error_message = calculate_curve_data(
-                        engine,
-                        target_product_id,
-                        risk_free,
-                        dividend,
-                        db_config,
-                        otm_range_pct,
-                        curve_mode,
-                    )
-                    if error_message:
-                        failed_results.append(f"{target_product_id}: {error_message}")
-                        continue
-
-                    payload = build_snapshot_payload(
-                        target_product_id,
-                        underlying_price,
-                        risk_free,
-                        dividend,
-                        eval_date,
-                        otm_range_pct,
-                        curve_mode,
-                        data,
-                    )
-                    snapshot_id = save_curve_snapshot(
-                        db_config,
-                        payload["snapshot"],
-                        payload["curve_points"],
-                    )
-                    saved_results.append(f"{target_product_id}#{snapshot_id}")
-
-                if failed_results:
-                    status.update(label="Batch save completed with warnings", state="error")
-                else:
-                    status.update(label="Batch save completed", state="complete")
-
-            feedback_parts = []
-            if saved_results:
-                feedback_parts.append(f"Saved {len(saved_results)} snapshot(s): {', '.join(saved_results)}")
-            if failed_results:
-                feedback_parts.append(f"Failed {len(failed_results)}: {'; '.join(failed_results)}")
-            st.session_state["save_feedback"] = " | ".join(feedback_parts)
+            snapshot_id = save_curve_snapshot(
+                db_config,
+                pending_snapshot["snapshot"],
+                pending_snapshot["curve_points"],
+            )
+            st.session_state["save_feedback"] = f"Saved current curve snapshot #{snapshot_id}"
             st.rerun()
 
     if manual_trigger or auto_refresh:

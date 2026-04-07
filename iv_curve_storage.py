@@ -129,6 +129,60 @@ def save_curve_snapshot(db_config, snapshot, curve_points):
         conn.close()
 
 
+def delete_curve_snapshot(db_config, snapshot_id):
+    conn = get_connection(db_config)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM iv_curve_snapshot WHERE id = %s", (snapshot_id,))
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def find_snapshot_id(db_config, underlying_id, curve_mode, evaluation_date, source, notes):
+    conn = get_connection(db_config)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT id
+            FROM iv_curve_snapshot
+            WHERE underlying_id = %s
+              AND curve_mode = %s
+              AND evaluation_date = %s
+              AND source = %s
+              AND (
+                    (notes IS NULL AND %s IS NULL)
+                 OR notes = %s
+              )
+            ORDER BY captured_at DESC, id DESC
+            LIMIT 1
+            """,
+            (underlying_id, curve_mode, evaluation_date, source, notes, notes),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def replace_curve_snapshot(db_config, snapshot, curve_points):
+    existing_snapshot_id = find_snapshot_id(
+        db_config,
+        snapshot["underlying_id"],
+        snapshot["curve_mode"],
+        snapshot["evaluation_date"],
+        snapshot.get("source", "web_app"),
+        snapshot.get("notes"),
+    )
+    if existing_snapshot_id is not None:
+        delete_curve_snapshot(db_config, existing_snapshot_id)
+
+    return save_curve_snapshot(db_config, snapshot, curve_points)
+
+
 def load_recent_curve_points(db_config, underlying_id, curve_mode, days):
     since_time = datetime.now() - timedelta(days=days)
     conn = get_connection(db_config)
