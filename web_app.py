@@ -18,6 +18,12 @@ from get_option_codes import get_available_underlyings, get_filtered_options
 from iv_curve_storage import ensure_tables, load_recent_curve_points, save_curve_snapshot
 from quote_engine import CTPMarketEngine
 
+SCHEDULE_SLOTS = (
+    ("09:30", 9 * 60 + 30),
+    ("13:45", 13 * 60 + 45),
+    ("22:00", 22 * 60),
+)
+
 
 def load_config_from_xml(file_path="config.xml"):
     if not os.path.isabs(file_path):
@@ -280,6 +286,48 @@ def filter_visible_curves(chart_df, history_df, selected_history_labels):
     return visible_chart_df, visible_history_df
 
 
+def infer_active_slot_label(reference_time=None):
+    if reference_time is None:
+        reference_time = datetime.now()
+
+    current_minutes = reference_time.hour * 60 + reference_time.minute
+    return min(SCHEDULE_SLOTS, key=lambda item: abs(current_minutes - item[1]))[0]
+
+
+def resolve_default_history_labels(history_df, reference_time=None):
+    if history_df.empty:
+        return []
+
+    slot_label = infer_active_slot_label(reference_time)
+    notes_series = history_df.get("notes")
+    if notes_series is not None:
+        normalized_notes = notes_series.fillna("").astype(str)
+        scheduled_mask = normalized_notes.str.startswith("scheduled@")
+        if scheduled_mask.any():
+            slot_note = f"scheduled@{slot_label}"
+            labels = history_df.loc[
+                scheduled_mask & (normalized_notes == slot_note),
+                "CurveLabel",
+            ].drop_duplicates().tolist()
+            if labels:
+                return labels
+
+    captured_at_series = pd.to_datetime(history_df.get("captured_at"), errors="coerce")
+    if captured_at_series.isna().all():
+        return history_df["CurveLabel"].drop_duplicates().tolist()
+
+    row_minutes = captured_at_series.dt.hour * 60 + captured_at_series.dt.minute
+    slot_minutes = [minutes for _, minutes in SCHEDULE_SLOTS]
+    distance_columns = [(row_minutes - minutes).abs() for minutes in slot_minutes]
+    nearest_slot_index = pd.concat(distance_columns, axis=1).idxmin(axis=1)
+    target_slot_index = next(i for i, (label, _) in enumerate(SCHEDULE_SLOTS) if label == slot_label)
+
+    labels = history_df.loc[nearest_slot_index == target_slot_index, "CurveLabel"].drop_duplicates().tolist()
+    if labels:
+        return labels
+    return history_df["CurveLabel"].drop_duplicates().tolist()
+
+
 def render_curve_section(display_payload):
     df = display_payload["current_df"]
     history_df = display_payload["history_df"]
@@ -306,11 +354,12 @@ def render_curve_section(display_payload):
     visible_history_df = history_df
     if show_history and not history_df.empty:
         history_labels = history_df["CurveLabel"].drop_duplicates().tolist()
+        default_history_labels = resolve_default_history_labels(history_df, datetime.now())
         selected_history_labels = st.multiselect(
             "Visible history timestamps",
             options=history_labels,
-            default=history_labels,
-            help="Uncheck timestamps to hide selected historical curves.",
+            default=default_history_labels,
+            help="By default, only historical curves in the current scheduled time slot are shown. You can check more.",
         )
         visible_chart_df, visible_history_df = filter_visible_curves(
             chart_df,
