@@ -129,6 +129,17 @@ def build_snapshot_payload(
     return {"snapshot": snapshot, "curve_points": curve_points}
 
 
+def filter_otm_curve_data(data, underlying_price):
+    return [
+        point
+        for point in data
+        if (
+            (point["Type"] == "Call" and point["Strike"] > underlying_price)
+            or (point["Type"] == "Put" and point["Strike"] < underlying_price)
+        )
+    ]
+
+
 def calculate_curve_data(engine, product_id, r, q, db_config, otm_range_pct, curve_mode):
     engine.subscribe([product_id.encode("utf-8")])
 
@@ -150,7 +161,7 @@ def calculate_curve_data(engine, product_id, r, q, db_config, otm_range_pct, cur
         otm_range_pct=otm_range_pct,
     )
     if not specs:
-        return None, None, f"No matching OTM options found for {product_id}."
+        return None, None, f"No matching options found in the configured strike range for {product_id}."
 
     inst_ids = [spec["InstrumentID"].encode("utf-8") for spec in specs]
     engine.subscribe(inst_ids)
@@ -230,4 +241,8 @@ def calculate_curve_data(engine, product_id, r, q, db_config, otm_range_pct, cur
     if not data:
         return underlying_price, None, f"No volatility data calculated for {product_id}."
 
-    return underlying_price, data, None
+    otm_data = filter_otm_curve_data(data, underlying_price)
+    if not otm_data:
+        return underlying_price, None, f"No OTM volatility data calculated for {product_id}."
+
+    return underlying_price, otm_data, None

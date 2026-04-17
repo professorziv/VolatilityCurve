@@ -136,7 +136,7 @@ def calculate_curve_data(engine, product_id, r, q, db_config, otm_range_pct, cur
         otm_range_pct=otm_range_pct,
     )
     if not specs:
-        return None, None, f"No matching OTM options found for {product_id}."
+        return None, None, f"No matching options found in the configured strike range for {product_id}."
 
     inst_ids = [spec["InstrumentID"].encode("utf-8") for spec in specs]
     engine.subscribe(inst_ids)
@@ -239,6 +239,13 @@ def build_chart_dataframe(current_df, current_label, history_df):
     return pd.concat([history_chart_df, current_chart_df], ignore_index=True, sort=False)
 
 
+def filter_otm_curve_dataframe(df, underlying_price):
+    return df[
+        ((df["Type"] == "Call") & (df["Strike"] > underlying_price))
+        | ((df["Type"] == "Put") & (df["Strike"] < underlying_price))
+    ].copy()
+
+
 def build_position_exposure_dataframe(df, underlying_price):
     exposure_df = df.copy()
     if "OrderLots" not in exposure_df.columns:
@@ -262,6 +269,103 @@ def build_position_exposure_dataframe(df, underlying_price):
         exposure_df["Vega"] * 0.01 * exposure_df["OrderLots"] * exposure_df["VolumeMultiple"].fillna(1)
     )
     return exposure_df
+
+
+def build_t_quote_dataframe(df, underlying_price):
+    exposure_df = build_position_exposure_dataframe(df, underlying_price)
+    exposure_df = exposure_df.rename(
+        columns={
+            "TotalDeltaLots": "TotalDelta",
+            "TotalGammaPnl": "TotalGamma",
+            "TotalThetaDaily": "TotalTheta",
+            "TotalVega1Pct": "TotalVega",
+        }
+    )
+
+    key_columns = ["ExpireDate", "Strike", "Side"]
+    value_columns = [
+        "Price",
+        "IV",
+        "Delta",
+        "TotalDelta",
+        "TotalGamma",
+        "TotalTheta",
+        "TotalVega",
+        "OrderLots",
+    ]
+
+    t_quote_df = None
+    for option_type in ("Call", "Put"):
+        side_df = exposure_df[exposure_df["Type"] == option_type][key_columns + value_columns].copy()
+        side_df = side_df.rename(columns={column: f"{option_type} {column}" for column in value_columns})
+        if t_quote_df is None:
+            t_quote_df = side_df
+        else:
+            t_quote_df = pd.merge(t_quote_df, side_df, on=key_columns, how="outer")
+
+    if t_quote_df is None:
+        return pd.DataFrame()
+
+    call_columns = [f"Call {column}" for column in reversed(value_columns)]
+    put_columns = [f"Put {column}" for column in value_columns]
+    ordered_columns = ["ExpireDate", "Side"] + call_columns + ["Strike"] + put_columns
+    t_quote_df = t_quote_df.reindex(columns=ordered_columns)
+    return t_quote_df.sort_values(["ExpireDate", "Strike", "Side"], ignore_index=True)
+
+
+def apply_t_quote_order_lots(source_df, edited_t_quote_df):
+    edited_df = source_df.copy()
+    if "OrderLots" not in edited_df.columns:
+        edited_df["OrderLots"] = 0
+
+    key_columns = [
+        column
+        for column in ["ExpireDate", "Strike", "Side"]
+        if column in edited_t_quote_df.columns
+    ]
+    if "Strike" not in key_columns:
+        return edited_df
+
+    edited_lots = []
+    for option_type in ("Call", "Put"):
+        lots_column = f"{option_type} OrderLots"
+        if lots_column not in edited_t_quote_df.columns:
+            continue
+
+        side_lots = edited_t_quote_df[key_columns + [lots_column]].copy()
+        side_lots["Type"] = option_type
+        side_lots = side_lots.rename(columns={lots_column: "EditedOrderLots"})
+        edited_lots.append(side_lots)
+
+    if not edited_lots:
+        return edited_df
+
+    lots_df = pd.concat(edited_lots, ignore_index=True)
+    edited_df = pd.merge(edited_df, lots_df, on=key_columns + ["Type"], how="left")
+    edited_df["OrderLots"] = edited_df["EditedOrderLots"].combine_first(edited_df["OrderLots"])
+    return edited_df.drop(columns=["EditedOrderLots"])
+
+
+def make_order_lots_key(row):
+    return f"{row['ExpireDate']}|{row['Strike']}|{row['Side']}|{row['Type']}"
+
+
+def build_total_greeks_summary(df, underlying_price):
+    exposure_df = build_position_exposure_dataframe(df, underlying_price)
+    greek_totals = exposure_df[
+        ["TotalDeltaLots", "TotalGammaPnl", "TotalThetaDaily", "TotalVega1Pct"]
+    ].sum(numeric_only=True)
+    return pd.DataFrame(
+        [
+            {
+                "Total Delta (Hedge)": -greek_totals.get("TotalDeltaLots", 0.0),
+                "Total Delta": greek_totals.get("TotalDeltaLots", 0.0),
+                "Total Gamma": greek_totals.get("TotalGammaPnl", 0.0),
+                "Total Theta": greek_totals.get("TotalThetaDaily", 0.0),
+                "Total Vega": greek_totals.get("TotalVega1Pct", 0.0),
+            }
+        ]
+    )
 
 
 def highlight_derived_columns(styler, derived_columns):
@@ -343,7 +447,7 @@ def render_curve_section(display_payload):
     st.subheader(f"Volatility Smile: {product_id} (Spot: {underlying_price})")
     caption_parts = [
         f"Curve mode: {curve_mode}",
-        f"OTM Range: {otm_range_pct:.0%}",
+        f"Strike Range: {otm_range_pct:.0%}",
         f"Last update: {last_update_time}",
     ]
     if show_history:
@@ -430,72 +534,129 @@ def render_curve_section(display_payload):
         if "OrderLots" not in editable_df.columns:
             editable_df["OrderLots"] = 0
 
+        order_lots_state_key = f"order_lots_{product_id}_{curve_mode}"
+        stored_order_lots = st.session_state.get(order_lots_state_key, {})
+        if stored_order_lots:
+            editable_df["OrderLots"] = editable_df.apply(
+                lambda row: stored_order_lots.get(make_order_lots_key(row), row["OrderLots"]),
+                axis=1,
+            )
+
+        t_quote_editor_df = build_t_quote_dataframe(editable_df, underlying_price)
+        editable_order_columns = ["Call OrderLots", "Put OrderLots"]
+        disabled_columns = [
+            column
+            for column in t_quote_editor_df.columns
+            if column not in editable_order_columns
+        ]
+        column_config = {
+            "ExpireDate": None,
+            "Side": None,
+            "Call Price": st.column_config.NumberColumn("C Px", format="%.3f", width="small"),
+            "Call IV": st.column_config.NumberColumn("C IV", format="%.3f", width="small"),
+            "Call Delta": st.column_config.NumberColumn("C Delta", format="%.3f", width="small"),
+            "Call TotalDelta": st.column_config.NumberColumn("C TDelta", format="%.3f", width="small"),
+            "Call TotalGamma": st.column_config.NumberColumn("C TGamma", format="%.3f", width="small"),
+            "Call TotalTheta": st.column_config.NumberColumn("C TTheta", format="%.3f", width="small"),
+            "Call TotalVega": st.column_config.NumberColumn("C TVega", format="%.3f", width="small"),
+            "Call OrderLots": st.column_config.NumberColumn(
+                "C Lots",
+                step=1,
+                format="%d",
+                width="small",
+            ),
+            "Strike": st.column_config.NumberColumn("Strike", format="%.3f", width="small"),
+            "Put Price": st.column_config.NumberColumn("P Px", format="%.3f", width="small"),
+            "Put IV": st.column_config.NumberColumn("P IV", format="%.3f", width="small"),
+            "Put Delta": st.column_config.NumberColumn("P Delta", format="%.3f", width="small"),
+            "Put TotalDelta": st.column_config.NumberColumn("P TDelta", format="%.3f", width="small"),
+            "Put TotalGamma": st.column_config.NumberColumn("P TGamma", format="%.3f", width="small"),
+            "Put TotalTheta": st.column_config.NumberColumn("P TTheta", format="%.3f", width="small"),
+            "Put TotalVega": st.column_config.NumberColumn("P TVega", format="%.3f", width="small"),
+            "Put OrderLots": st.column_config.NumberColumn(
+                "P Lots",
+                step=1,
+                format="%d",
+                width="small",
+            ),
+        }
+        column_order = [
+            "Call OrderLots",
+            "Call TotalVega",
+            "Call TotalTheta",
+            "Call TotalGamma",
+            "Call TotalDelta",
+            "Call Delta",
+            "Call Price",
+            "Call IV",
+            "Strike",
+            "Put IV",
+            "Put Price",
+            "Put Delta",
+            "Put TotalDelta",
+            "Put TotalGamma",
+            "Put TotalTheta",
+            "Put TotalVega",
+            "Put OrderLots",
+        ]
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stDataFrame"] [role="gridcell"],
+            div[data-testid="stDataFrame"] [role="columnheader"] {
+                font-size: 11px;
+                line-height: 1.1;
+                padding: 2px 4px;
+                text-align: center;
+            }
+            div[data-testid="stDataFrame"] [aria-colindex="1"],
+            div[data-testid="stDataFrame"] [aria-colindex="9"],
+            div[data-testid="stDataFrame"] [aria-colindex="17"] {
+                font-weight: 700;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        summary_df = build_total_greeks_summary(editable_df, underlying_price)
+        st.dataframe(
+            summary_df.style.format("{:.3f}"),
+            hide_index=True,
+            use_container_width=True,
+        )
+
         edited_df = st.data_editor(
-            editable_df,
+            t_quote_editor_df,
             hide_index=True,
             use_container_width=True,
             key=f"order_lots_editor_{product_id}_{curve_mode}",
-            column_config={
-                "OrderLots": st.column_config.NumberColumn(
-                    "OrderLots (hands)",
-                    min_value=0,
-                    step=1,
-                    format="%d",
-                ),
-            },
+            column_order=column_order,
+            disabled=disabled_columns,
+            column_config=column_config,
         )
 
-        exposure_df = build_position_exposure_dataframe(edited_df, underlying_price)
-        display_df = exposure_df.rename(
-            columns={
-                "DailyMove": "dS",
-                "TotalDeltaLots": "TotalDelta (hands)",
-                "TotalGammaPnl": "TotalGamma (CNY)",
-                "TotalThetaDaily": "TotalTheta (CNY/day)",
-                "TotalVega1Pct": "TotalVega (CNY/1%)",
-            }
-        )
-        display_columns = [
-            "InstrumentID",
-            "Strike",
-            "Type",
-            "Side",
-            "Price",
-            "IV",
-            "Delta",
-            "Gamma",
-            "Theta",
-            "Vega",
-            "OrderLots",
-            "dS",
-            "TotalDelta (hands)",
-            "TotalGamma (CNY)",
-            "TotalTheta (CNY/day)",
-            "TotalVega (CNY/1%)",
-        ]
-        display_df = display_df[display_columns]
-        derived_columns = [
-            "OrderLots",
-            "dS",
-            "TotalDelta (hands)",
-            "TotalGamma (CNY)",
-            "TotalTheta (CNY/day)",
-            "TotalVega (CNY/1%)",
-        ]
-        styled_display_df = highlight_derived_columns(display_df.style, derived_columns)
-        st.dataframe(styled_display_df, use_container_width=True)
-
-        greek_totals = exposure_df[
-            ["TotalDeltaLots", "TotalGammaPnl", "TotalThetaDaily", "TotalVega1Pct"]
-        ].sum(numeric_only=True)
+        edited_position_df = apply_t_quote_order_lots(editable_df, edited_df)
+        normalized_order_lots = pd.to_numeric(
+            edited_position_df["OrderLots"],
+            errors="coerce",
+        ).fillna(0).astype(int)
+        next_order_lots = {
+            make_order_lots_key(row): int(normalized_order_lots.loc[index])
+            for index, row in edited_position_df.iterrows()
+        }
+        if next_order_lots != stored_order_lots:
+            st.session_state[order_lots_state_key] = next_order_lots
+            st.rerun()
         st.caption(
-            "Portfolio Greek totals"
-            f" | Delta: {greek_totals.get('TotalDeltaLots', 0.0):.4f} hands"
-            f" | Gamma: {greek_totals.get('TotalGammaPnl', 0.0):.4f} CNY"
-            f" | Theta: {greek_totals.get('TotalThetaDaily', 0.0):.4f} CNY/day"
-            f" | Vega: {greek_totals.get('TotalVega1Pct', 0.0):.4f} CNY/1%"
+            "Definition"
+            " | TotalDelta: Delta x OrderLots, unit = hands"
+            " | TotalDelta (Hedge): -TotalDelta, unit = futures hands"
+            " | TotalGamma: 0.5 x Gamma x dS^2 x OrderLots x VolumeMultiple, unit = CNY"
+            " | TotalTheta: Theta x OrderLots x VolumeMultiple / 244, unit = CNY/day"
+            " | TotalVega: Vega x 1% x OrderLots x VolumeMultiple, unit = CNY/1%"
         )
-        st.caption(
+        _ = (
             "Definition"
             " | TotalDelta: Delta × OrderLots, unit = hands"
             " | TotalGamma: 0.5 × Gamma × dS^2 × OrderLots × VolumeMultiple, unit = CNY"
@@ -540,7 +701,7 @@ def main():
 
     risk_free = st.sidebar.number_input("Risk Free Rate", 0.0, 0.2, 0.05, 0.001)
     dividend = st.sidebar.number_input("Dividend Yield", 0.0, 0.2, 0.05, 0.001)
-    otm_range_pct = st.sidebar.slider("OTM Range (%)", min_value=1, max_value=20, value=10, step=1) / 100.0
+    otm_range_pct = st.sidebar.slider("Strike Range (%)", min_value=1, max_value=20, value=10, step=1) / 100.0
     curve_mode = st.sidebar.radio("Curve Mode", options=["Bid/Ask", "Mid"], index=0)
     eval_date = st.sidebar.date_input("Evaluation Date", value=datetime.now())
     show_history = st.sidebar.checkbox("Overlay Historical Curves", value=False)
@@ -632,12 +793,17 @@ def run_process(engine, product_id, r, q, db_config, otm_range_pct, curve_mode, 
     st.session_state["last_update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     df = pd.DataFrame(data)
+    otm_df = filter_otm_curve_dataframe(df, underlying_price)
+    if otm_df.empty:
+        st.error(f"No OTM volatility data calculated for {product_id}.")
+        return
+
     current_label = f"Current {st.session_state['last_update_time']}"
     history_df = pd.DataFrame()
     if show_history:
         history_df = load_recent_curve_points(db_config, product_id, curve_mode, history_days)
 
-    chart_df = build_chart_dataframe(df, current_label, history_df)
+    chart_df = build_chart_dataframe(otm_df, current_label, history_df)
     st.session_state["pending_snapshot"] = build_snapshot_payload(
         product_id,
         underlying_price,
@@ -646,7 +812,7 @@ def run_process(engine, product_id, r, q, db_config, otm_range_pct, curve_mode, 
         eval_date,
         otm_range_pct,
         curve_mode,
-        data,
+        otm_df.to_dict("records"),
     )
     st.session_state["curve_display"] = {
         "current_df": df,

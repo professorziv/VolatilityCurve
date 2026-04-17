@@ -30,7 +30,7 @@ def parse_args():
     parser.add_argument("--products", help="Comma-separated underlying IDs. Overrides configured scheduled targets.")
     parser.add_argument("--risk-free", type=float, default=0.05, help="Risk free rate.")
     parser.add_argument("--dividend", type=float, default=0.05, help="Dividend yield.")
-    parser.add_argument("--otm-range-pct", type=float, default=0.10, help="OTM range as decimal.")
+    parser.add_argument("--otm-range-pct", type=float, default=0.10, help="Strike range around spot as decimal.")
     parser.add_argument(
         "--slot",
         choices=["09:30", "13:45", "22:00"],

@@ -9,8 +9,8 @@ except ImportError:
 
 def get_filtered_options(product_id, underlying_price, db_config, otm_range_pct=0.10):
     """
-    Fetch option contracts from MySQL and keep only OTM contracts within
-    the configured range around the spot price.
+    Fetch option contracts from MySQL and keep all Call/Put contracts whose
+    strikes are within the configured range around the spot price.
     """
     selected_specs = []
     upper_multiplier = 1 + otm_range_pct
@@ -33,22 +33,16 @@ def get_filtered_options(product_id, underlying_price, db_config, otm_range_pct=
 
         print(
             f"Found {len(all_options)} related contracts in the database. "
-            f"Filtering with spot price {underlying_price} and OTM range {otm_range_pct:.0%}..."
+            f"Filtering with spot price {underlying_price} and strike range {otm_range_pct:.0%}..."
         )
 
         for opt in all_options:
             strike = opt["StrikePrice"]
             otype = opt["OptionsType"]
-
-            is_selected = False
-            if otype == "Call":
-                if underlying_price < strike <= underlying_price * upper_multiplier:
-                    is_selected = True
-            elif otype == "Put":
-                if underlying_price * lower_multiplier <= strike < underlying_price:
-                    is_selected = True
-
-            if is_selected:
+            if (
+                otype in {"Call", "Put"}
+                and underlying_price * lower_multiplier <= strike <= underlying_price * upper_multiplier
+            ):
                 selected_specs.append(opt)
 
     except mysql.connector.Error as err:
