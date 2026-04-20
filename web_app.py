@@ -8,6 +8,12 @@ import pandas as pd
 import streamlit as st
 
 try:
+    from st_aggrid import AgGrid, DataReturnMode, GridOptionsBuilder, JsCode
+except ImportError:
+    st.error("Missing dependency. Please run: pip install streamlit-aggrid")
+    st.stop()
+
+try:
     import XHPricingPy as xh
 except (ImportError, RuntimeError):
     st.error("Missing dependencies. Please run: pip install XHPricingPy mysql-connector-python streamlit pandas altair")
@@ -318,32 +324,25 @@ def apply_t_quote_order_lots(source_df, edited_t_quote_df):
     if "OrderLots" not in edited_df.columns:
         edited_df["OrderLots"] = 0
 
-    key_columns = [
-        column
-        for column in ["ExpireDate", "Strike", "Side"]
-        if column in edited_t_quote_df.columns
-    ]
-    if "Strike" not in key_columns:
-        return edited_df
+    edited_lots_by_key = {}
+    for _, row in edited_t_quote_df.iterrows():
+        for option_type in ("Call", "Put"):
+            key_column = f"{option_type}Key"
+            lots_column = f"{option_type} OrderLots"
+            if lots_column not in edited_t_quote_df.columns:
+                continue
 
-    edited_lots = []
-    for option_type in ("Call", "Put"):
-        lots_column = f"{option_type} OrderLots"
-        if lots_column not in edited_t_quote_df.columns:
-            continue
+            row_key = row.get(key_column)
+            if row_key is None or pd.isna(row_key):
+                continue
 
-        side_lots = edited_t_quote_df[key_columns + [lots_column]].copy()
-        side_lots["Type"] = option_type
-        side_lots = side_lots.rename(columns={lots_column: "EditedOrderLots"})
-        edited_lots.append(side_lots)
+            edited_lots_by_key[str(row_key)] = row.get(lots_column, 0)
 
-    if not edited_lots:
-        return edited_df
-
-    lots_df = pd.concat(edited_lots, ignore_index=True)
-    edited_df = pd.merge(edited_df, lots_df, on=key_columns + ["Type"], how="left")
-    edited_df["OrderLots"] = edited_df["EditedOrderLots"].combine_first(edited_df["OrderLots"])
-    return edited_df.drop(columns=["EditedOrderLots"])
+    edited_df["OrderLots"] = edited_df.apply(
+        lambda row: edited_lots_by_key.get(make_order_lots_key(row), row["OrderLots"]),
+        axis=1,
+    )
+    return edited_df
 
 
 def make_order_lots_key(row):
@@ -366,6 +365,164 @@ def build_total_greeks_summary(df, underlying_price):
             }
         ]
     )
+
+
+def get_t_quote_column_order():
+    return [
+        "Call OrderLots",
+        "Call TotalVega",
+        "Call TotalTheta",
+        "Call TotalGamma",
+        "Call TotalDelta",
+        "Call Delta",
+        "Call Price",
+        "Call IV",
+        "Strike",
+        "Put IV",
+        "Put Price",
+        "Put Delta",
+        "Put TotalDelta",
+        "Put TotalGamma",
+        "Put TotalTheta",
+        "Put TotalVega",
+        "Put OrderLots",
+    ]
+
+
+def get_t_quote_labels():
+    return {
+        "Call OrderLots": "C Lot",
+        "Call TotalVega": "C Tν",
+        "Call TotalTheta": "C Tθ",
+        "Call TotalGamma": "C Tγ",
+        "Call TotalDelta": "C Tδ",
+        "Call Delta": "C δ",
+        "Call Price": "C Px",
+        "Call IV": "C IV",
+        "Strike": "Strike",
+        "Put IV": "P IV",
+        "Put Price": "P Px",
+        "Put Delta": "P δ",
+        "Put TotalDelta": "P Tδ",
+        "Put TotalGamma": "P Tγ",
+        "Put TotalTheta": "P Tθ",
+        "Put TotalVega": "P Tν",
+        "Put OrderLots": "P Lot",
+    }
+
+
+def get_aggrid_formatter(column_name):
+    if column_name == "Strike":
+        return "value == null ? '' : Number(value).toFixed(0)"
+    if column_name.endswith("Delta") and "Total" not in column_name:
+        return "value == null ? '' : Number(value).toFixed(4)"
+    if column_name.endswith("Price"):
+        return "value == null ? '' : Number(value).toFixed(2)"
+    if column_name.endswith("TotalDelta"):
+        return "value == null ? '' : Number(value).toFixed(1)"
+    if (
+        column_name.endswith("TotalGamma")
+        or column_name.endswith("TotalTheta")
+        or column_name.endswith("TotalVega")
+    ):
+        return "value == null ? '' : Number(value).toFixed(0)"
+    if column_name.endswith("OrderLots"):
+        return "value == null ? '' : Number(value).toFixed(0)"
+    return "value == null ? '' : Number(value).toFixed(3)"
+
+
+def normalize_aggrid_response_data(grid_response):
+    data = getattr(grid_response, "data", pd.DataFrame())
+    if isinstance(data, pd.DataFrame):
+        return data
+    return pd.DataFrame(data)
+
+
+def render_aggrid_t_quote_table(t_quote_df, product_id, curve_mode):
+    labels = get_t_quote_labels()
+    visible_columns = get_t_quote_column_order()
+    grid_df = t_quote_df[["ExpireDate", "Side"] + visible_columns].copy()
+    grid_df["CallKey"] = grid_df.apply(
+        lambda row: f"{row['ExpireDate']}|{row['Strike']}|{row['Side']}|Call",
+        axis=1,
+    )
+    grid_df["PutKey"] = grid_df.apply(
+        lambda row: f"{row['ExpireDate']}|{row['Strike']}|{row['Side']}|Put",
+        axis=1,
+    )
+
+    gb = GridOptionsBuilder.from_dataframe(grid_df)
+    gb.configure_default_column(
+        filter=False,
+        sortable=False,
+        resizable=True,
+        editable=False,
+        cellStyle={"textAlign": "center", "fontSize": "10px", "padding": "1px"},
+        headerClass="t-quote-header",
+    )
+    gb.configure_column("ExpireDate", hide=True)
+    gb.configure_column("Side", hide=True)
+    gb.configure_column("CallKey", hide=True)
+    gb.configure_column("PutKey", hide=True)
+
+    for column_name in visible_columns:
+        cell_style = {"textAlign": "center", "fontSize": "10px", "padding": "1px"}
+        editable = False
+        width = 68
+        if column_name == "Strike":
+            cell_style.update({"fontWeight": "700", "backgroundColor": "#e8f3ff"})
+            width = 74
+        elif column_name.endswith("IV"):
+            cell_style.update({"backgroundColor": "#fff8d8"})
+            width = 62
+        elif column_name.endswith("OrderLots"):
+            cell_style.update({"fontWeight": "700", "backgroundColor": "#e8f6ec"})
+            editable = True
+            width = 72
+        elif "Total" in column_name:
+            width = 80
+        elif column_name.endswith("Price"):
+            width = 62
+
+        gb.configure_column(
+            column_name,
+            header_name=labels[column_name],
+            editable=editable,
+            type=["numericColumn"],
+            width=width,
+            cellStyle=cell_style,
+            valueFormatter=JsCode(f"function(params) {{ const value = params.value; return {get_aggrid_formatter(column_name)}; }}"),
+        )
+
+    grid_options = gb.build()
+    grid_options["suppressHorizontalScroll"] = False
+    grid_options["domLayout"] = "normal"
+    grid_options["rowHeight"] = 28
+    grid_options["headerHeight"] = 30
+    custom_css = {
+        ".t-quote-header": {
+            "font-size": "10px",
+            "font-weight": "700",
+            "text-align": "center",
+        },
+        ".ag-header-cell-label": {
+            "justify-content": "center",
+        },
+    }
+
+    grid_response = AgGrid(
+        grid_df,
+        gridOptions=grid_options,
+        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+        update_on=["cellValueChanged"],
+        fit_columns_on_grid_load=False,
+        allow_unsafe_jscode=True,
+        theme="alpine",
+        custom_css=custom_css,
+        height=min(520, 34 + 29 * (len(grid_df) + 1)),
+        key=f"aggrid_t_quote_{product_id}_{curve_mode}",
+    )
+    return normalize_aggrid_response_data(grid_response)
 
 
 def highlight_derived_columns(styler, derived_columns):
@@ -497,32 +654,9 @@ def render_curve_section(display_payload):
     ).properties(width=chart_width, height=450)
 
     line = base.mark_line(interpolate="cardinal", tension=0.8)
-    current_points = alt.Chart(visible_chart_df[visible_chart_df["CurveSource"] == "Current"]).mark_point(
-        filled=True,
-        size=60,
-    ).encode(
-        x=alt.X("Strike:Q", scale=alt.Scale(zero=False), title="Strike Price"),
-        y=alt.Y(
-            "IV:Q",
-            axis=alt.Axis(format="%"),
-            title="Implied Volatility",
-            scale=alt.Scale(zero=False),
-        ),
-        color=alt.Color("CurveLabel:N", title="Curve"),
-        strokeDash=alt.StrokeDash("Side:N", title="Side"),
-        tooltip=[
-            "Strike",
-            "Type",
-            "Side",
-            "CurveLabel",
-            "Price",
-            alt.Tooltip("Delta", format=".4f"),
-            alt.Tooltip("Gamma", format=".6f"),
-            alt.Tooltip("Theta", format=".4f"),
-            alt.Tooltip("Vega", format=".4f"),
-            alt.Tooltip("IV", format=".2%"),
-        ],
-    )
+    current_points = base.transform_filter(
+        alt.datum.CurveSource == "Current"
+    ).mark_point(filled=True, size=60)
 
     chart = (line + current_points).interactive()
     left_spacer, center_col, right_spacer = st.columns([1, 4, 1])
@@ -543,82 +677,6 @@ def render_curve_section(display_payload):
             )
 
         t_quote_editor_df = build_t_quote_dataframe(editable_df, underlying_price)
-        editable_order_columns = ["Call OrderLots", "Put OrderLots"]
-        disabled_columns = [
-            column
-            for column in t_quote_editor_df.columns
-            if column not in editable_order_columns
-        ]
-        column_config = {
-            "ExpireDate": None,
-            "Side": None,
-            "Call Price": st.column_config.NumberColumn("C Px", format="%.3f", width="small"),
-            "Call IV": st.column_config.NumberColumn("C IV", format="%.3f", width="small"),
-            "Call Delta": st.column_config.NumberColumn("C Delta", format="%.3f", width="small"),
-            "Call TotalDelta": st.column_config.NumberColumn("C TDelta", format="%.3f", width="small"),
-            "Call TotalGamma": st.column_config.NumberColumn("C TGamma", format="%.3f", width="small"),
-            "Call TotalTheta": st.column_config.NumberColumn("C TTheta", format="%.3f", width="small"),
-            "Call TotalVega": st.column_config.NumberColumn("C TVega", format="%.3f", width="small"),
-            "Call OrderLots": st.column_config.NumberColumn(
-                "C Lots",
-                step=1,
-                format="%d",
-                width="small",
-            ),
-            "Strike": st.column_config.NumberColumn("Strike", format="%.3f", width="small"),
-            "Put Price": st.column_config.NumberColumn("P Px", format="%.3f", width="small"),
-            "Put IV": st.column_config.NumberColumn("P IV", format="%.3f", width="small"),
-            "Put Delta": st.column_config.NumberColumn("P Delta", format="%.3f", width="small"),
-            "Put TotalDelta": st.column_config.NumberColumn("P TDelta", format="%.3f", width="small"),
-            "Put TotalGamma": st.column_config.NumberColumn("P TGamma", format="%.3f", width="small"),
-            "Put TotalTheta": st.column_config.NumberColumn("P TTheta", format="%.3f", width="small"),
-            "Put TotalVega": st.column_config.NumberColumn("P TVega", format="%.3f", width="small"),
-            "Put OrderLots": st.column_config.NumberColumn(
-                "P Lots",
-                step=1,
-                format="%d",
-                width="small",
-            ),
-        }
-        column_order = [
-            "Call OrderLots",
-            "Call TotalVega",
-            "Call TotalTheta",
-            "Call TotalGamma",
-            "Call TotalDelta",
-            "Call Delta",
-            "Call Price",
-            "Call IV",
-            "Strike",
-            "Put IV",
-            "Put Price",
-            "Put Delta",
-            "Put TotalDelta",
-            "Put TotalGamma",
-            "Put TotalTheta",
-            "Put TotalVega",
-            "Put OrderLots",
-        ]
-        st.markdown(
-            """
-            <style>
-            div[data-testid="stDataFrame"] [role="gridcell"],
-            div[data-testid="stDataFrame"] [role="columnheader"] {
-                font-size: 11px;
-                line-height: 1.1;
-                padding: 2px 4px;
-                text-align: center;
-            }
-            div[data-testid="stDataFrame"] [aria-colindex="1"],
-            div[data-testid="stDataFrame"] [aria-colindex="9"],
-            div[data-testid="stDataFrame"] [aria-colindex="17"] {
-                font-weight: 700;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-
         summary_df = build_total_greeks_summary(editable_df, underlying_price)
         st.dataframe(
             summary_df.style.format("{:.3f}"),
@@ -626,17 +684,8 @@ def render_curve_section(display_payload):
             use_container_width=True,
         )
 
-        edited_df = st.data_editor(
-            t_quote_editor_df,
-            hide_index=True,
-            use_container_width=True,
-            key=f"order_lots_editor_{product_id}_{curve_mode}",
-            column_order=column_order,
-            disabled=disabled_columns,
-            column_config=column_config,
-        )
-
-        edited_position_df = apply_t_quote_order_lots(editable_df, edited_df)
+        edited_t_quote_df = render_aggrid_t_quote_table(t_quote_editor_df, product_id, curve_mode)
+        edited_position_df = apply_t_quote_order_lots(editable_df, edited_t_quote_df)
         normalized_order_lots = pd.to_numeric(
             edited_position_df["OrderLots"],
             errors="coerce",
@@ -655,13 +704,6 @@ def render_curve_section(display_payload):
             " | TotalGamma: 0.5 x Gamma x dS^2 x OrderLots x VolumeMultiple, unit = CNY"
             " | TotalTheta: Theta x OrderLots x VolumeMultiple / 244, unit = CNY/day"
             " | TotalVega: Vega x 1% x OrderLots x VolumeMultiple, unit = CNY/1%"
-        )
-        _ = (
-            "Definition"
-            " | TotalDelta: Delta × OrderLots, unit = hands"
-            " | TotalGamma: 0.5 × Gamma × dS^2 × OrderLots × VolumeMultiple, unit = CNY"
-            " | TotalTheta: Theta × OrderLots × VolumeMultiple / 244, unit = CNY/day"
-            " | TotalVega: Vega × 1% × OrderLots × VolumeMultiple, unit = CNY/1%"
         )
 
         if show_history and not visible_history_df.empty:
@@ -692,7 +734,7 @@ def main():
         return get_available_underlyings(config)
 
     available_unds = fetch_underlyings(db_config)
-    default_idx = available_unds.index("cu2604") if "cu2604" in available_unds else 0
+    default_idx = 0
 
     if available_unds:
         product_id = st.sidebar.selectbox("Underlying ID", available_unds, index=default_idx)
@@ -702,13 +744,13 @@ def main():
     risk_free = st.sidebar.number_input("Risk Free Rate", 0.0, 0.2, 0.05, 0.001)
     dividend = st.sidebar.number_input("Dividend Yield", 0.0, 0.2, 0.05, 0.001)
     otm_range_pct = st.sidebar.slider("Strike Range (%)", min_value=1, max_value=20, value=10, step=1) / 100.0
-    curve_mode = st.sidebar.radio("Curve Mode", options=["Bid/Ask", "Mid"], index=0)
+    curve_mode = st.sidebar.radio("Curve Mode", options=["Bid/Ask", "Mid"], index=1)
     eval_date = st.sidebar.date_input("Evaluation Date", value=datetime.now())
-    show_history = st.sidebar.checkbox("Overlay Historical Curves", value=False)
+    show_history = st.sidebar.checkbox("Overlay Historical Curves", value=True)
     history_days = st.sidebar.selectbox(
         "History Range",
         options=[1, 2, 3, 7, 15],
-        index=0,
+        index=2,
         format_func=lambda days: f"{days} day(s)",
     )
 
