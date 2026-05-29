@@ -755,6 +755,9 @@ def main():
     )
 
     st.sidebar.markdown("---")
+    st.sidebar.markdown("**其他工具**")
+    st.sidebar.page_link("http://127.0.0.1:8050", label="铜价看板", icon="📊")
+    st.sidebar.markdown("---")
     auto_refresh = st.sidebar.checkbox("Enable Auto-Refresh (1 min)", value=False)
 
     update_eval_date(eval_date)
