@@ -9,3 +9,7 @@ QueryRsp.con
 TradingDay.con
 
 config.xml
+
+# Streamlit 运行日志
+streamlit_stdout.log
+streamlit_stderr.log

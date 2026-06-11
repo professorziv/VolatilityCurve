@@ -23,6 +23,11 @@ from VanillaOption import VanillaOption
 from get_option_codes import get_available_underlyings, get_filtered_options
 from iv_curve_storage import ensure_tables, load_recent_curve_points, save_curve_snapshot
 from quote_engine import CTPMarketEngine
+from implied_distribution import (
+    compute_distributions_from_df,
+    build_dist_chart_df,
+    lognormal_rnd,
+)
 
 SCHEDULE_SLOTS = (
     ("09:30", 9 * 60 + 30),
@@ -438,7 +443,7 @@ def normalize_aggrid_response_data(grid_response):
     return pd.DataFrame(data)
 
 
-def render_aggrid_t_quote_table(t_quote_df, product_id, curve_mode):
+def render_aggrid_t_quote_table(t_quote_df, product_id, curve_mode, lots_hash=0):
     labels = get_t_quote_labels()
     visible_columns = get_t_quote_column_order()
     grid_df = t_quote_df[["ExpireDate", "Side"] + visible_columns].copy()
@@ -520,7 +525,7 @@ def render_aggrid_t_quote_table(t_quote_df, product_id, curve_mode):
         theme="alpine",
         custom_css=custom_css,
         height=min(520, 34 + 29 * (len(grid_df) + 1)),
-        key=f"aggrid_t_quote_{product_id}_{curve_mode}",
+        key=f"aggrid_t_quote_{product_id}_{curve_mode}_{lots_hash}",
     )
     return normalize_aggrid_response_data(grid_response)
 
@@ -589,6 +594,113 @@ def resolve_default_history_labels(history_df, reference_time=None):
     return history_df["CurveLabel"].drop_duplicates().tolist()
 
 
+def _build_distribution_chart(display_payload, visible_history_df):
+    """Build and return the Altair implied distribution chart, or None on failure."""
+    otm_df           = display_payload.get("otm_df")
+    underlying_price = display_payload["underlying_price"]
+    r                = display_payload["r"]
+    q                = display_payload["q"]
+    eval_date        = display_payload["eval_date"]
+    current_label    = display_payload.get("current_label", "Current")
+
+    if otm_df is None or otm_df.empty:
+        return None
+
+    current_dists = compute_distributions_from_df(otm_df, underlying_price, r, q, eval_date)
+    if not current_dists:
+        return None
+
+    dists_by_label: dict = {current_label: current_dists}
+
+    if not visible_history_df.empty:
+        hist_mid = visible_history_df[visible_history_df["side"] == "Mid"].copy()
+        for curve_label, group in hist_mid.groupby("CurveLabel"):
+            hist_S    = group["spot_price"].iloc[0]    if "spot_price"    in group.columns else underlying_price
+            hist_r    = group["risk_free_rate"].iloc[0] if "risk_free_rate" in group.columns else r
+            hist_q    = group["dividend_yield"].iloc[0] if "dividend_yield" in group.columns else q
+            hist_eval = group["evaluation_date"].iloc[0] if "evaluation_date" in group.columns else eval_date
+            hist_dists = compute_distributions_from_df(group, hist_S, hist_r, hist_q, hist_eval)
+            if hist_dists:
+                dists_by_label[curve_label] = hist_dists
+
+    implied_df, ref_df = build_dist_chart_df(dists_by_label, current_label)
+    if implied_df.empty:
+        return None
+
+    current_df  = implied_df[implied_df["IsCurrentCurve"]]
+    history_df_ = implied_df[~implied_df["IsCurrentCurve"]]
+
+    _xy_enc = dict(
+        x=alt.X("Moneyness:Q", title="ln(K/S)", scale=alt.Scale(zero=False)),
+        y=alt.Y("pdf:Q", title="Probability Density", scale=alt.Scale(zero=True)),
+        strokeDash=alt.StrokeDash("ExpireDate:N", title="Expiry"),
+        tooltip=[
+            "CurveLabel", "ExpireDate",
+            alt.Tooltip("Moneyness:Q", format=".3f"),
+            alt.Tooltip("pdf:Q", format=".5f"),
+        ],
+    )
+
+    # Distinguishable palette for history (excludes red)
+    _HIST_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd",
+                    "#8c564b", "#17becf", "#e377c2", "#7f7f7f"]
+
+    layers = []
+    # History: distinct colors, no markers
+    if not history_df_.empty:
+        layers.append(
+            alt.Chart(history_df_)
+            .mark_line(opacity=0.65, strokeWidth=1.5)
+            .encode(
+                **_xy_enc,
+                color=alt.Color("CurveLabel:N", title="Curve",
+                                scale=alt.Scale(range=_HIST_COLORS)),
+            )
+        )
+    # Current: red line
+    layers.append(
+        alt.Chart(current_df)
+        .mark_line(color="#e74c3c", strokeWidth=2.5)
+        .encode(**_xy_enc)
+    )
+    # Current markers: subsample every 25 rows per expiry to avoid clutter
+    _idx = current_df.groupby(["ExpireDate", "CurveLabel"]).cumcount()
+    marker_df = current_df[_idx % 25 == 0]
+    layers.append(
+        alt.Chart(marker_df)
+        .mark_point(color="#e74c3c", filled=True, size=45, opacity=0.85)
+        .encode(
+            x=alt.X("Moneyness:Q"),
+            y=alt.Y("pdf:Q"),
+            shape=alt.Shape("ExpireDate:N", title="Expiry"),
+            tooltip=_xy_enc["tooltip"],
+        )
+    )
+
+    # Log-normal BS reference (dashed gray)
+    if not ref_df.empty:
+        layers.append(
+            alt.Chart(ref_df)
+            .mark_line(strokeDash=[6, 3], strokeWidth=1.5, color="#888")
+            .encode(
+                x=alt.X("Moneyness:Q"),
+                y=alt.Y("pdf:Q"),
+                tooltip=["RefLabel", alt.Tooltip("Moneyness:Q", format=".3f"),
+                         alt.Tooltip("pdf:Q", format=".5f")],
+            )
+        )
+
+    # ATM reference line at ln(K/S) = 0
+    layers.append(
+        alt.Chart(pd.DataFrame({"Moneyness": [0.0]}))
+        .mark_rule(color="#e74c3c", strokeWidth=1.5, strokeDash=[5, 3], opacity=0.7)
+        .encode(x=alt.X("Moneyness:Q", title="ln(K/S)"),
+                tooltip=[alt.Tooltip("Moneyness:Q", title="ATM", format=".3f")])
+    )
+
+    return alt.layer(*layers).properties(height=380).interactive()
+
+
 def render_curve_section(display_payload):
     df = display_payload["current_df"]
     history_df = display_payload["history_df"]
@@ -628,40 +740,64 @@ def render_curve_section(display_payload):
             selected_history_labels,
         )
 
-    chart_width = 780
-    base = alt.Chart(visible_chart_df).encode(
+    _HIST_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd",
+                    "#8c564b", "#17becf", "#e377c2", "#7f7f7f"]
+
+    _smile_tooltip = [
+        "Strike", "Type", "Side", "CurveLabel", "Price",
+        alt.Tooltip("Delta", format=".4f"),
+        alt.Tooltip("Gamma", format=".6f"),
+        alt.Tooltip("Theta", format=".4f"),
+        alt.Tooltip("Vega", format=".4f"),
+        alt.Tooltip("IV", format=".2%"),
+    ]
+    _smile_enc = dict(
         x=alt.X("Strike:Q", scale=alt.Scale(zero=False), title="Strike Price"),
-        y=alt.Y(
-            "IV:Q",
-            axis=alt.Axis(format="%"),
-            title="Implied Volatility",
-            scale=alt.Scale(zero=False),
-        ),
-        color=alt.Color("CurveLabel:N", title="Curve"),
+        y=alt.Y("IV:Q", axis=alt.Axis(format="%"), title="Implied Volatility",
+                scale=alt.Scale(zero=False)),
         strokeDash=alt.StrokeDash("Side:N", title="Side"),
-        tooltip=[
-            "Strike",
-            "Type",
-            "Side",
-            "CurveLabel",
-            "Price",
-            alt.Tooltip("Delta", format=".4f"),
-            alt.Tooltip("Gamma", format=".6f"),
-            alt.Tooltip("Theta", format=".4f"),
-            alt.Tooltip("Vega", format=".4f"),
-            alt.Tooltip("IV", format=".2%"),
-        ],
-    ).properties(width=chart_width, height=450)
+        tooltip=_smile_tooltip,
+    )
 
-    line = base.mark_line(interpolate="cardinal", tension=0.8)
-    current_points = base.transform_filter(
-        alt.datum.CurveSource == "Current"
-    ).mark_point(filled=True, size=60)
+    current_smile_df = visible_chart_df[visible_chart_df["CurveSource"] == "Current"]
+    history_smile_df = visible_chart_df[visible_chart_df["CurveSource"] != "Current"]
 
-    chart = (line + current_points).interactive()
-    left_spacer, center_col, right_spacer = st.columns([1, 4, 1])
-    with center_col:
-        st.altair_chart(chart, use_container_width=False)
+    smile_layers = []
+    if not history_smile_df.empty:
+        smile_layers.append(
+            alt.Chart(history_smile_df)
+            .mark_line(interpolate="cardinal", tension=0.8, opacity=0.65, strokeWidth=1.5)
+            .encode(**_smile_enc,
+                    color=alt.Color("CurveLabel:N", title="Curve",
+                                    scale=alt.Scale(range=_HIST_COLORS)))
+        )
+    smile_layers.append(
+        alt.Chart(current_smile_df)
+        .mark_line(color="#e74c3c", interpolate="cardinal", tension=0.8, strokeWidth=2.5)
+        .encode(**_smile_enc)
+    )
+    smile_layers.append(
+        alt.Chart(current_smile_df)
+        .mark_point(color="#e74c3c", filled=True, size=60)
+        .encode(x=alt.X("Strike:Q"), y=alt.Y("IV:Q"),
+                strokeDash=alt.StrokeDash("Side:N"), tooltip=_smile_tooltip)
+    )
+    smile_chart = alt.layer(*smile_layers).properties(height=380).interactive()
+
+    dist_chart = _build_distribution_chart(display_payload, visible_history_df)
+
+    if dist_chart is not None:
+        smile_col, dist_col = st.columns(2)
+        with smile_col:
+            st.caption("Vol Smile")
+            st.altair_chart(smile_chart, use_container_width=True)
+        with dist_col:
+            st.caption("Implied Risk-Neutral Distribution  ·  Breeden-Litzenberger d²C/dK²")
+            st.altair_chart(dist_chart, use_container_width=True)
+    else:
+        left_spacer, center_col, right_spacer = st.columns([1, 4, 1])
+        with center_col:
+            st.altair_chart(smile_chart, use_container_width=True)
 
     with st.expander("Raw Data"):
         editable_df = df.copy()
@@ -684,7 +820,8 @@ def render_curve_section(display_payload):
             use_container_width=True,
         )
 
-        edited_t_quote_df = render_aggrid_t_quote_table(t_quote_editor_df, product_id, curve_mode)
+        lots_hash = hash(tuple(sorted(stored_order_lots.items())))
+        edited_t_quote_df = render_aggrid_t_quote_table(t_quote_editor_df, product_id, curve_mode, lots_hash)
         edited_position_df = apply_t_quote_order_lots(editable_df, edited_t_quote_df)
         normalized_order_lots = pd.to_numeric(
             edited_position_df["OrderLots"],
@@ -861,10 +998,15 @@ def run_process(engine, product_id, r, q, db_config, otm_range_pct, curve_mode, 
     )
     st.session_state["curve_display"] = {
         "current_df": df,
+        "otm_df": otm_df,
         "history_df": history_df,
         "chart_df": chart_df,
         "product_id": product_id,
         "underlying_price": underlying_price,
+        "r": r,
+        "q": q,
+        "eval_date": eval_date,
+        "current_label": current_label,
         "curve_mode": curve_mode,
         "otm_range_pct": otm_range_pct,
         "last_update_time": st.session_state["last_update_time"],

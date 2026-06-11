@@ -193,6 +193,10 @@ def load_recent_curve_points(db_config, underlying_id, curve_mode, days):
             SELECT
                 s.id AS snapshot_id,
                 s.captured_at,
+                s.spot_price,
+                s.risk_free_rate,
+                s.dividend_yield,
+                s.evaluation_date,
                 s.source,
                 s.notes,
                 p.instrument_id,
